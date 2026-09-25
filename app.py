@@ -11,7 +11,7 @@ from openpyxl.utils import get_column_letter
 st.set_page_config(page_title="Chakradhara Aerospace - Sales Invoice Extractor", page_icon="✈️", layout="wide")
 
 st.title("✈️ Chakradhara Aerospace - Sales Invoice Extractor")
-st.write("Upload sales invoice PDFs across all formats to extract structured tax details (including Non-Taxable/Exempt items) and export to formatted Excel.")
+st.write("Upload sales invoice PDFs across all formats to extract structured details and export to formatted Excel.")
 
 # Official Company GSTIN List for Chakradhara Aerospace
 COMPANY_GSTINS = {
