@@ -11,7 +11,7 @@ from openpyxl.utils import get_column_letter
 st.set_page_config(page_title="Chakradhara Aerospace - Sales Invoice Extractor", page_icon="✈️", layout="wide")
 
 st.title("✈️ Chakradhara Aerospace - Sales Invoice Extractor")
-st.write("Upload sales invoice PDFs to extract structured tax details and export to formatted Excel.")
+st.write("Upload sales invoice PDFs across all formats to extract structured tax details and export to formatted Excel.")
 
 # Official Company GSTIN List for Chakradhara Aerospace
 COMPANY_GSTINS = {
@@ -65,13 +65,48 @@ def parse_date(date_str):
                     continue
     return None
 
+def extract_customer_name(text):
+    """Extracts Customer / Recipient Name across all document layout variations."""
+    patterns = [
+        r'(?:Client Name|Customer Name)\s*[:\-]?\s*([^\n]+)',
+        r'(?:Name\s*&\s*Address\s*of\s*Bill\s*To|Name\s*&\s*Address\s*Of\s*Recipient|Name\s*and\s*address\s*of\s*the\s*receipient|Name\s*and\s*address\s*of\s*receipient)\s*[\n\r]+\s*(?:Customer\s*[:\-]?)?\s*([^\n]+)',
+        r'Customer\s*[:\-]\s*([^\n]+)',
+        r'(?:Billed\s*To|Bill\s*To|Recipient)\s*[:\-]?\s*\n?\s*([^\n]+)',
+        r'M/s\.?\s*([^\n]+)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip()
+            # Cleanup noise if matched labels accidentally
+            if not re.search(r'GSTIN|PAN|State|Address|Phone|Invoice|Date', name, re.IGNORECASE) and len(name) > 3:
+                return name
+    return "N/A"
+
+def extract_hsn_sac(text):
+    """Extracts HSN/SAC code across line items, tables, and description headers."""
+    # Pattern 1: Inline HSN / SAC label
+    match = re.search(r'(?:HSN\s*\/\s*SAC|SAC\s*\/\s*HSN|HSN\s*Code|SAC\s*Code|SAC|HSN)\s*[:\-]?\s*(\d{4,8})', text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    
+    # Pattern 2: Multi-line description HSN occurrence
+    match_inline = re.search(r'\b(99\d{4}|87\d{6}|\d{4,8})\b', text)
+    if match_inline and re.search(r'HSN|SAC|Transport|Services|Spares|Goods', text, re.IGNORECASE):
+        # Scan for common HSN/SAC codes in logistics / transport
+        all_codes = re.findall(r'\b(99\d{4}|8708\d{4}|\d{4,8})\b', text)
+        if all_codes:
+            return all_codes[0]
+            
+    return "N/A"
+
 def extract_sales_invoice_data(pdf_bytes):
     """Extracts required fields from Chakradhara Aerospace invoice formats."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = "".join([page.get_text() for page in doc])
     doc.close()
 
-    # 1. Identify GSTINs
+    # 1. Identify Seller GSTIN & Customer GSTIN
     all_gstins = re.findall(r'\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}\b', text)
     
     my_gstin = "N/A"
@@ -83,50 +118,82 @@ def extract_sales_invoice_data(pdf_bytes):
         elif gstin not in COMPANY_GSTINS and customer_gstin == "N/A":
             customer_gstin = gstin
 
-    # Fallback if both GSTINs are from company or regular pattern lookup
     if my_gstin == "N/A" and len(all_gstins) > 0:
         my_gstin = all_gstins[0]
     if customer_gstin == "N/A" and len(all_gstins) > 1:
         customer_gstin = all_gstins[1]
 
-    # 2. Customer / Recipient Name
-    cust_name_match = re.search(r'(?:Billed\s*To|Recipient|Customer\s*Name|Party\s*Name|M/s\.?)\s*[:\-]?\s*([^\n]+)', text, re.IGNORECASE)
-    customer_name = cust_name_match.group(1).strip() if cust_name_match else "N/A"
+    # 2. Customer Name
+    customer_name = extract_customer_name(text)
 
     # 3. Invoice Number
-    inv_no_match = re.search(r'(?:Invoice\s*No\.?|Inv\s*No\.?|Invoice\s*#)\s*[:\-]?\s*([A-Za-z0-9\/\-]+)', text, re.IGNORECASE)
+    inv_no_match = re.search(r'(?:Invoice\s*No\.?|Inv\s*No\.?|INVOICE\040NO|Invoice\s*#|Inv\.\s*No\s*[:\-]?)\s*[:\-]?\s*([A-Za-z0-9\/\-]+)', text, re.IGNORECASE)
     invoice_no = inv_no_match.group(1).strip() if inv_no_match else "N/A"
 
     # 4. Invoice Date
-    inv_date_match = re.search(r'(?:Invoice\s*Date|Dated|Date)\s*[:\-]?\s*(\d{1,2}[\/\.-]\w+[\/\.-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', text, re.IGNORECASE)
+    inv_date_match = re.search(r'(?:Invoice\s*Date|Inv\.\s*Date|DATE|Dated|Date)\s*[:\-]?\s*(\d{1,2}[\/\.-]\w+[\/\.-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', text, re.IGNORECASE)
     raw_date = inv_date_match.group(1).strip() if inv_date_match else "N/A"
     invoice_date = parse_date(raw_date)
 
     # 5. Place of Supply / State Code
-    pos_match = re.search(r'(?:Place\s*of\s*Supply|State\s*Code|State\s*Name|POS)\s*[:\-]?\s*([A-Za-z0-9\s\(\)\-]+)', text, re.IGNORECASE)
+    pos_match = re.search(r'(?:Place\s*of\s*Supply|State\s*Code|State\s*Name|POS|State)\s*[:\-]?\s*([A-Za-z0-9\s\(\)\-]+)', text, re.IGNORECASE)
     place_of_supply = pos_match.group(1).strip().split('\n')[0] if pos_match else "N/A"
 
     # 6. HSN / SAC Code
-    hsn_match = re.search(r'(?:HSN\s*\/\s*SAC|HSN\s*Code|SAC\s*Code)\s*[:\-]?\s*(\d{4,8})', text, re.IGNORECASE)
-    hsn_code = hsn_match.group(1).strip() if hsn_match else "N/A"
+    hsn_code = extract_hsn_sac(text)
 
-    # 7. Amounts & Taxes
-    taxable_val_match = re.search(r'(?:Taxable\s*Value|Sub\s*Total|Taxable\s*Amount)\s*[:\-]?\s*(?:₹|Rs\.?)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
-    taxable_value = parse_float(taxable_val_match.group(1)) if taxable_val_match else 0.0
+    # 7. Taxable Value & Taxes (CGST, SGST, IGST)
+    taxable_value = 0.0
+    cgst = 0.0
+    sgst = 0.0
+    igst = 0.0
 
-    cgst_match = re.search(r'(?:CGST)\s*(?:@\s*\d+%\s*)?[:\-]?\s*(?:₹|Rs\.?)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
-    cgst = parse_float(cgst_match.group(1)) if cgst_match else 0.0
+    # Taxable Value Detection
+    taxable_match = re.search(r'(?:Total\s*Taxable\s*Amount|Taxable\s*Value|Sub\s*Total|Taxable\s*Amount|Total\s*Amount\s*Before\s*Tax)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
+    if taxable_match:
+        taxable_value = parse_float(taxable_match.group(1))
 
-    sgst_match = re.search(r'(?:SGST|UTGST)\s*(?:@\s*\d+%\s*)?[:\-]?\s*(?:₹|Rs\.?)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
-    sgst = parse_float(sgst_match.group(1)) if sgst_match else 0.0
+    # CGST Detection
+    cgst_match = re.search(r'(?:CGST)\s*(?:@\s*[\d\.]+%|\(INR\)|\d+%)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
+    if cgst_match:
+        cgst = parse_float(cgst_match.group(1))
 
-    igst_match = re.search(r'(?:IGST)\s*(?:@\s*\d+%\s*)?[:\-]?\s*(?:₹|Rs\.?)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
-    igst = parse_float(igst_match.group(1)) if igst_match else 0.0
+    # SGST Detection
+    sgst_match = re.search(r'(?:SGST|UTGST)\s*(?:@\s*[\d\.]+%|\(INR\)|\d+%)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
+    if sgst_match:
+        sgst = parse_float(sgst_match.group(1))
+
+    # IGST Detection
+    igst_match = re.search(r'(?:IGST)\s*(?:@\s*[\d\.]+%|Tax|Tax\s*%)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
+    if igst_match:
+        igst = parse_float(igst_match.group(1))
+
+    # Fallback checking table summary blocks for CGST/SGST/IGST
+    if cgst == 0.0 and sgst == 0.0 and igst == 0.0:
+        # Check explicit tabular patterns (e.g. 16,471.71 CGST / SGST)
+        rates_amounts = re.findall(r'(\b[\d,]+\.\d{2}\b)', text)
+        cgst_table = re.search(r'CGST[\s\S]{1,50}?([\d,]+\.\d{2})', text, re.IGNORECASE)
+        sgst_table = re.search(r'SGST[\s\S]{1,50}?([\d,]+\.\d{2})', text, re.IGNORECASE)
+        igst_table = re.search(r'IGST[\s\S]{1,50}?([\d,]+\.\d{2})', text, re.IGNORECASE)
+
+        if cgst_table:
+            cgst = parse_float(cgst_table.group(1))
+        if sgst_table:
+            sgst = parse_float(sgst_table.group(1))
+        if igst_table:
+            igst = parse_float(igst_table.group(1))
 
     total_tax = round(cgst + sgst + igst, 2)
 
-    total_inv_val_match = re.search(r'(?:Grand\s*Total|Invoice\s*Total|Total\s*Amount)\s*[:\-]?\s*(?:₹|Rs\.?)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
-    total_invoice_value = parse_float(total_inv_val_match.group(1)) if total_inv_val_match else (taxable_value + total_tax)
+    # 8. Total Invoice Value
+    total_inv_val_match = re.search(r'(?:Net\s*Payable|Total\s*Invoice\s*Value|Total\s*\[INR\]|Gross\040Total|Total\s*Amount)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
+    if total_inv_val_match:
+        total_invoice_value = parse_float(total_inv_val_match.group(1))
+    else:
+        total_invoice_value = round(taxable_value + total_tax, 2)
+
+    if taxable_value == 0.0 and total_invoice_value > 0.0:
+        taxable_value = round(total_invoice_value - total_tax, 2)
 
     return {
         "GSTIN": my_gstin,
