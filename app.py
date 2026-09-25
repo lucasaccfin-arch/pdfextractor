@@ -11,7 +11,7 @@ from openpyxl.utils import get_column_letter
 st.set_page_config(page_title="Chakradhara Aerospace - Sales Invoice Extractor", page_icon="✈️", layout="wide")
 
 st.title("✈️ Chakradhara Aerospace - Sales Invoice Extractor")
-st.write("Upload sales invoice PDFs across all formats to extract structured tax details and export to formatted Excel.")
+st.write("Upload sales invoice PDFs across all formats to extract structured tax details (including Non-Taxable/Exempt items) and export to formatted Excel.")
 
 # Official Company GSTIN List for Chakradhara Aerospace
 COMPANY_GSTINS = {
@@ -66,21 +66,26 @@ def parse_date(date_str):
     return None
 
 def extract_customer_name(text):
-    """Extracts Customer / Recipient Name while filtering out addresses and page tokens."""
+    """Extracts Customer Name directly under Customer header ignoring page numbers."""
+    match = re.search(r'Customer\s*[:\-]\s*[\r\n]+\s*([A-Za-z0-9\s&\.\,\-\(\)]+)', text, re.IGNORECASE)
+    if match:
+        lines = [line.strip() for line in match.group(1).split('\n') if line.strip()]
+        for line in lines:
+            if not re.search(r'Page|GSTIN|PAN|State|Address|Phone|Invoice|Date|ACK|IRN', line, re.IGNORECASE) and len(line) > 3:
+                return line
+
     patterns = [
-        r'Customer\s*[:\-]\s*\n?\s*([^\n]+)',
+        r'Customer\s*[:\-]\s*([^\n]+)',
         r'(?:Client Name|Customer Name)\s*[:\-]?\s*([^\n]+)',
-        r'(?:Name\s*&\s*Address\s*of\s*Bill\s*To|Name\s*&\s*Address\s*Of\s*Recipient|Name\s*and\s*address\s*of\s*the\s*receipient)\s*[\n\r]+\s*(?:Customer\s*[:\-]?)?\s*([^\n]+)',
-        r'(?:Billed\s*To|Bill\s*To|Recipient)\s*[:\-]?\s*\n?\s*([^\n]+)',
-        r'M/s\.?\s*([^\n]+)'
+        r'(?:Name\s*&\s*Address\s*of\s*Bill\s*To|Name\s*and\s*address\s*of\s*the\s*receipient)\s*[\n\r]+\s*([^\n]+)'
     ]
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            name = match.group(1).strip()
-            # Reject matched system text, headers, and PIN codes
-            if not re.search(r'GSTIN|PAN|State|Address|Phone|Invoice|Date|Page\s*:', name, re.IGNORECASE) and len(name) > 3:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            if not re.search(r'Page\s*:|GSTIN|PAN|State|Address|Phone|Invoice', name, re.IGNORECASE) and len(name) > 3:
                 return name
+
     return "N/A"
 
 def extract_place_of_supply(text):
@@ -93,25 +98,62 @@ def extract_place_of_supply(text):
     return "N/A"
 
 def extract_hsn_sac(text):
-    """Extracts HSN/SAC code strictly ignoring PIN codes (like 600008)."""
-    # Look for 6-digit or 8-digit codes near SAC/HSN table headers or inline fields
+    """Extracts HSN/SAC code from line item tables while ignoring PIN codes."""
     match_table = re.search(r'(?:SAC\s*\/\s*HSN|HSN\s*\/\s*SAC|SAC|HSN)\s*[\n\r\s]+([0-9]{4,8})', text, re.IGNORECASE)
     if match_table:
         code = match_table.group(1).strip()
-        # Ensure it's not a postal PIN code starting with 600 or 110 unless matched in line item table
         if not code.startswith("6000") and not code.startswith("1100"):
             return code
 
-    match_inline = re.search(r'(?:SAC\s*Code|HSN\s*Code|SAC|HSN)\s*[:\-]?\s*([0-9]{4,8})', text, re.IGNORECASE)
+    match_inline = re.search(r'(?:SAC\s*Code|HSN\s*Code)\s*[:\-]?\s*([0-9]{4,8})', text, re.IGNORECASE)
     if match_inline:
         return match_inline.group(1).strip()
 
-    # Fallback search for valid SAC codes starting with 99
     sac_fallback = re.search(r'\b(99\d{4})\b', text)
     if sac_fallback:
         return sac_fallback.group(1).strip()
 
     return "N/A"
+
+def extract_line_item_breakdown(text):
+    """
+    Parses line item tables to extract Non-Taxable / Exempt Values, Taxable Values,
+    CGST, SGST, and IGST line by line.
+    """
+    non_taxable_exempt = 0.0
+    taxable_value = 0.0
+    cgst = 0.0
+    sgst = 0.0
+    igst = 0.0
+
+    # Pattern for Reimbursement / Non GST Exempt Line Items (e.g., CUSTOMS DUTY -REIM - SI)
+    reim_items = re.findall(r'(?:REIM|REIMBURSEMENT|DUTY|NON-GST|EXEMPT)[\s\S]*?([\d,]+\.\d{2})', text, re.IGNORECASE)
+    
+    # Check table structure for "Non GST Exempt Value (INR)" column
+    exempt_match = re.search(r'Non\s*GST\s*Exempt\s*Value\s*(?:\(INR\))?[\s\S]*?([\d,]+\.\d{2})', text, re.IGNORECASE)
+    if exempt_match:
+        non_taxable_exempt = parse_float(exempt_match.group(1))
+
+    # Check Taxable Value column
+    taxable_match = re.search(r'Taxable\s*Value\s*(?:\(INR\))?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
+    if taxable_match:
+        taxable_value = parse_float(taxable_match.group(1))
+
+    # Check IGST column
+    igst_match = re.search(r'IGST[\s\S]{1,30}?Tax[\s\S]{1,30}?([\d,]+\.\d{2})', text, re.IGNORECASE)
+    if igst_match:
+        igst = parse_float(igst_match.group(1))
+
+    # Check CGST / SGST columns
+    cgst_match = re.search(r'CGST[\s\S]{1,30}?Tax[\s\S]{1,30}?([\d,]+\.\d{2})', text, re.IGNORECASE)
+    if cgst_match:
+        cgst = parse_float(cgst_match.group(1))
+
+    sgst_match = re.search(r'SGST[\s\S]{1,30}?Tax[\s\S]{1,30}?([\d,]+\.\d{2})', text, re.IGNORECASE)
+    if sgst_match:
+        sgst = parse_float(sgst_match.group(1))
+
+    return non_taxable_exempt, taxable_value, cgst, sgst, igst
 
 def extract_sales_invoice_data(pdf_bytes):
     """Extracts required fields from Chakradhara Aerospace invoice formats."""
@@ -152,40 +194,17 @@ def extract_sales_invoice_data(pdf_bytes):
     # 5. HSN / SAC Code
     hsn_code = extract_hsn_sac(text)
 
-    # 6. Tax Values Extraction Logic (Handling Exempt / Pure Agent vs Taxable)
-    taxable_value = 0.0
-    cgst = 0.0
-    sgst = 0.0
-    igst = 0.0
-
-    # Extract Taxable Value specifically
-    taxable_match = re.search(r'Taxable\s*Value\s*(?:\(INR\))?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2}|[\d,]+)', text, re.IGNORECASE)
-    if taxable_match:
-        taxable_value = parse_float(taxable_match.group(1))
-
-    # Extract IGST specifically
-    igst_match = re.search(r'IGST\s*(?:%|Tax)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if igst_match:
-        igst = parse_float(igst_match.group(1))
-
-    # Extract CGST / SGST
-    cgst_match = re.search(r'CGST\s*(?:%|Tax)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if cgst_match:
-        cgst = parse_float(cgst_match.group(1))
-
-    sgst_match = re.search(r'SGST\s*(?:%|Tax)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if sgst_match:
-        sgst = parse_float(sgst_match.group(1))
+    # 6. Extract Line Item Tax Breakdown
+    non_taxable_exempt, taxable_value, cgst, sgst, igst = extract_line_item_breakdown(text)
 
     total_tax = round(cgst + sgst + igst, 2)
 
     # 7. Total Invoice Value
-    # Check for Total (INR) in line items or grand total footer
     total_match = re.search(r'Total\s*(?:\(INR\)|Value|Amount)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
     if total_match:
         total_invoice_value = parse_float(total_match.group(1))
     else:
-        total_invoice_value = round(taxable_value + total_tax, 2)
+        total_invoice_value = round(taxable_value + non_taxable_exempt + total_tax, 2)
 
     return {
         "GSTIN": my_gstin,
@@ -195,6 +214,7 @@ def extract_sales_invoice_data(pdf_bytes):
         "Invoice Date": invoice_date,
         "Place of Supply": place_of_supply,
         "HSN/SAC": hsn_code,
+        "Non-Taxable / Exempt Value": non_taxable_exempt,
         "Taxable Value": taxable_value,
         "CGST": cgst,
         "SGST": sgst,
@@ -219,7 +239,7 @@ def format_excel_workbook(df):
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    num_cols = {"Taxable Value", "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value"}
+    num_cols = {"Non-Taxable / Exempt Value", "Taxable Value", "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value"}
     
     # Append Data Rows
     for row_idx, row in enumerate(df.itertuples(index=False), start=2):
@@ -267,8 +287,8 @@ if uploaded_files:
         df = pd.DataFrame(results)
         
         cols = ["Filename", "GSTIN", "Customer Name", "Customer GSTIN", "Invoice No", "Invoice Date", 
-                "Place of Supply", "HSN/SAC", "Taxable Value", "CGST", "SGST", "IGST", 
-                "Total Tax", "Total Invoice Value"]
+                "Place of Supply", "HSN/SAC", "Non-Taxable / Exempt Value", "Taxable Value", 
+                "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value"]
         df = df[cols]
 
         st.success(f"Processed {len(results)} invoices successfully!")
