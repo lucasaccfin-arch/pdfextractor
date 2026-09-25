@@ -49,9 +49,6 @@ NAME_CONTINUATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-uploaded_files = st.file_uploader("Upload Sales Invoice PDFs", type=["pdf"], accept_multiple_files=True)
-
-
 # ---------------------------------------------------------------------------
 # Basic helpers
 # ---------------------------------------------------------------------------
@@ -169,7 +166,7 @@ def _looks_like_label_junk(s):
 def extract_customer_name(text):
     lines = text.split('\n')
     label_res = [
-        re.compile(r'^\s*Customer\s*:\s*(.*)$', re.IGNORECASE),
+        re.compile(r'^\s*Customer\s*-?\s*:\s*(.*)$', re.IGNORECASE),
         re.compile(r'^\s*Client\s*Name\s*:\s*(.*)$', re.IGNORECASE),
     ]
     for i, raw_line in enumerate(lines):
@@ -469,7 +466,8 @@ def extract_sales_invoice_data(pdf_bytes):
 # ---------------------------------------------------------------------------
 
 def format_excel_workbook(df):
-    """Formats Excel file with correct Date, Number types, Alignment, Auto-filters, and Auto-fit."""
+    """Formats Excel file: bold + center-aligned header with auto-filter,
+    left-aligned data rows, and dates shown as dd/mm/yyyy."""
     output = io.BytesIO()
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -491,12 +489,12 @@ def format_excel_workbook(df):
 
             if col_name == "Invoice Date" and pd.notnull(val):
                 cell.value = val
-                cell.number_format = 'yyyy-mm-dd'
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.number_format = 'dd/mm/yyyy'
+                cell.alignment = Alignment(horizontal="left", vertical="center")
             elif col_name in num_cols:
                 cell.value = float(val) if val is not None else 0.0
                 cell.number_format = '#,##0.00'
-                cell.alignment = Alignment(horizontal="right", vertical="center")
+                cell.alignment = Alignment(horizontal="left", vertical="center")
             else:
                 cell.value = str(val) if val is not None else ""
                 cell.alignment = Alignment(horizontal="left", vertical="center")
@@ -522,8 +520,38 @@ def format_excel_workbook(df):
 # Streamlit app
 # ---------------------------------------------------------------------------
 
+if "extracted_df" not in st.session_state:
+    st.session_state.extracted_df = None
+if "excel_bytes" not in st.session_state:
+    st.session_state.excel_bytes = None
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+
+def clear_all():
+    """Resets the app back to its initial state: clears results and the
+    file uploader (bumping its widget key forces Streamlit to recreate it
+    empty)."""
+    st.session_state.extracted_df = None
+    st.session_state.excel_bytes = None
+    st.session_state.uploader_key += 1
+
+
+uploaded_files = st.file_uploader(
+    "Upload Sales Invoice PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
+    key=f"uploader_{st.session_state.uploader_key}",
+)
+
 if uploaded_files:
-    if st.button("Extract Invoice Details"):
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        extract_clicked = st.button("Extract Invoice Details", type="primary")
+    with col2:
+        st.button("🔄 Clear", on_click=clear_all)
+
+    if extract_clicked:
         results = []
         for file in uploaded_files:
             pdf_bytes = file.read()
@@ -538,14 +566,20 @@ if uploaded_files:
                 "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value"]
         df = df[cols]
 
-        st.success(f"Processed {len(results)} invoices successfully!")
-        st.dataframe(df)
+        st.session_state.extracted_df = df
+        st.session_state.excel_bytes = format_excel_workbook(df)
+elif st.session_state.extracted_df is not None:
+    # Files were cleared from the uploader but results are still held from a
+    # previous run -- offer Clear so the person can fully reset the page.
+    st.button("🔄 Clear", on_click=clear_all)
 
-        excel_bytes = format_excel_workbook(df)
+if st.session_state.extracted_df is not None:
+    st.success(f"Processed {len(st.session_state.extracted_df)} invoices successfully!")
+    st.dataframe(st.session_state.extracted_df)
 
-        st.download_button(
-            label="📥 Download Structured Excel File",
-            data=excel_bytes,
-            file_name="Chakradhara_Sales_Invoices.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    st.download_button(
+        label="📥 Download Structured Excel File",
+        data=st.session_state.excel_bytes,
+        file_name="Chakradhara_Sales_Invoices.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
