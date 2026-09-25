@@ -24,34 +24,69 @@ COMPANY_GSTINS = {
     "33AAHCC1431F1Z9"
 }
 
+GSTIN_RE = re.compile(r'\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}\b')
+
+# Standard GST state codes (first two digits of any GSTIN) -> state/UT name.
+# Used as a last-resort fallback to derive Place of Supply when the invoice
+# text has no explicit "Place of Supply" / "State" label with a value.
+GST_STATE_CODES = {
+    "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab",
+    "04": "Chandigarh", "05": "Uttarakhand", "06": "Haryana", "07": "Delhi",
+    "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
+    "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur",
+    "15": "Mizoram", "16": "Tripura", "17": "Meghalaya", "18": "Assam",
+    "19": "West Bengal", "20": "Jharkhand", "21": "Odisha",
+    "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
+    "25": "Daman and Diu", "26": "Dadra and Nagar Haveli",
+    "27": "Maharashtra", "28": "Andhra Pradesh (Old)", "29": "Karnataka",
+    "30": "Goa", "31": "Lakshadweep", "32": "Kerala", "33": "Tamil Nadu",
+    "34": "Puducherry", "35": "Andaman and Nicobar Islands",
+    "36": "Telangana", "37": "Andhra Pradesh", "38": "Ladakh",
+}
+
+NAME_CONTINUATION_RE = re.compile(
+    r'^(PRIVATE\s+LIMITED|LIMITED|LTD\.?|PVT\.?\s*LTD\.?|\(P\)\s*LTD\.?|CO\.?\s*LTD\.?|PRIVATE\s+LTD\.?)$',
+    re.IGNORECASE,
+)
+
 uploaded_files = st.file_uploader("Upload Sales Invoice PDFs", type=["pdf"], accept_multiple_files=True)
 
+
+# ---------------------------------------------------------------------------
+# Basic helpers
+# ---------------------------------------------------------------------------
+
 def parse_float(val):
-    """Safely extracts clean floating numbers from text."""
-    if not val or val == "N/A":
+    """Safely extracts a clean float from text like '1,23,456.78', '₹ 1,234.00' or '-'."""
+    if val is None:
         return 0.0
-    cleaned = re.sub(r'[^\d\.]', '', str(val))
+    s = str(val).strip()
+    if not s or s.upper() == "N/A" or s == "-":
+        return 0.0
+    cleaned = re.sub(r'[^\d\.\-]', '', s)
+    if cleaned in ("", "-", ".", "-."):
+        return 0.0
     try:
-        return float(cleaned) if cleaned else 0.0
+        return float(cleaned)
     except ValueError:
         return 0.0
 
+
 def parse_date(date_str):
-    """Converts extracted text dates into standard datetime objects."""
-    if not date_str or date_str == "N/A":
+    """Converts extracted text dates into datetime objects, trying multiple formats."""
+    if not date_str:
         return None
-    
+
     date_patterns = [
-        r'\d{2}[\/\.-]\d{2}[\/\.-]\d{4}',
-        r'\d{2}[\/\.-]\d{2}[\/\.-]\d{2}',
+        r'\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{4}',
+        r'\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{2}',
         r'\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}',
-        r'\d{1,2}[\/\.-][A-Za-z]{3}[\/\.-]\d{2,4}'
+        r'\d{1,2}[\/\.-][A-Za-z]{3}[\/\.-]\d{2,4}',
     ]
-    
     date_formats = [
         "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
         "%d/%m/%y", "%d-%m-%y", "%d.%m.%y",
-        "%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%b-%y"
+        "%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%b-%y",
     ]
 
     for pattern in date_patterns:
@@ -65,146 +100,351 @@ def parse_date(date_str):
                     continue
     return None
 
+
+def clean_text(text):
+    """
+    Strips digital-signature appearance-stream garbage that PyMuPDF sometimes
+    leaks into extracted text as one giant unbroken token (this never occurs
+    in normal invoice text, which is short words/numbers separated by
+    whitespace).
+    """
+    return re.sub(r'\S{60,}', ' ', text)
+
+
+def get_pdf_text(pdf_bytes):
+    """
+    Extracts text using PyMuPDF with sort=True, which reorders text into
+    natural reading order. Without this, PyMuPDF returns text in internal
+    PDF-object order, which for table-heavy invoices comes out scrambled
+    (numbers from unrelated rows/columns interleave with each other) --
+    this was the root cause of most of the bad extractions previously.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = "\n".join(page.get_text(sort=True) for page in doc)
+    doc.close()
+    return clean_text(text)
+
+
+# ---------------------------------------------------------------------------
+# Header field extraction
+# ---------------------------------------------------------------------------
+
+def extract_gstins(text):
+    """Finds all GSTIN-like strings and splits into company GSTIN vs customer GSTIN."""
+    all_gstins = GSTIN_RE.findall(text)
+    my_gstin, customer_gstin = "N/A", "N/A"
+    for g in all_gstins:
+        if g in COMPANY_GSTINS and my_gstin == "N/A":
+            my_gstin = g
+        elif g not in COMPANY_GSTINS and customer_gstin == "N/A":
+            customer_gstin = g
+    if my_gstin == "N/A" and all_gstins:
+        my_gstin = all_gstins[0]
+    if customer_gstin == "N/A":
+        remaining = [g for g in all_gstins if g != my_gstin]
+        if remaining:
+            customer_gstin = remaining[0]
+    return my_gstin, customer_gstin
+
+
+def _first_segment(s):
+    """Takes the text before the first run of 2+ spaces (i.e. before the next
+    visual 'column' on the same printed line), trimming a trailing comma."""
+    s = s.strip()
+    if not s:
+        return ''
+    return re.split(r'\s{2,}', s)[0].strip().rstrip(',')
+
+
+def _looks_like_label_junk(s):
+    """True if a candidate name is actually a neighbouring field label that
+    got pulled onto the same line by the PDF's column layout."""
+    return bool(re.search(
+        r':|Invoice\s*No|Invoice\s*Date|\bGSTIN\b|\bPAN\b|Ref\.\s*No|Division\s*:|\bAck\b|'
+        r'State\s*:|Address\s*:|^Date\b',
+        s, re.IGNORECASE,
+    ))
+
+
 def extract_customer_name(text):
-    """Extracts Customer Name directly under Customer header ignoring page numbers."""
-    match = re.search(r'Customer\s*[:\-]\s*[\r\n]+\s*([A-Za-z0-9\s&\.\,\-\(\)]+)', text, re.IGNORECASE)
-    if match:
-        lines = [line.strip() for line in match.group(1).split('\n') if line.strip()]
-        for line in lines:
-            if not re.search(r'Page|GSTIN|PAN|State|Address|Phone|Invoice|Date|ACK|IRN', line, re.IGNORECASE) and len(line) > 3:
-                return line
-
-    patterns = [
-        r'Customer\s*[:\-]\s*([^\n]+)',
-        r'(?:Client Name|Customer Name)\s*[:\-]?\s*([^\n]+)',
-        r'(?:Name\s*&\s*Address\s*of\s*Bill\s*To|Name\s*and\s*address\s*of\s*the\s*receipient)\s*[\n\r]+\s*([^\n]+)'
+    lines = text.split('\n')
+    label_res = [
+        re.compile(r'^\s*Customer\s*:\s*(.*)$', re.IGNORECASE),
+        re.compile(r'^\s*Client\s*Name\s*:\s*(.*)$', re.IGNORECASE),
     ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
+    for i, raw_line in enumerate(lines):
+        for lr in label_res:
+            m = lr.match(raw_line)
+            if not m:
+                continue
+            candidate = _first_segment(m.group(1))
+            if candidate and _looks_like_label_junk(candidate):
+                candidate = ''
+            if not candidate:
+                # Value wasn't on this line (e.g. "Customer :" alone) -- the
+                # actual name usually appears on the next non-blank line.
+                for j in range(i + 1, min(i + 3, len(lines))):
+                    nxt = lines[j].strip()
+                    if not nxt:
+                        continue
+                    seg = _first_segment(nxt)
+                    if seg and len(seg) > 3 and not _looks_like_label_junk(seg):
+                        candidate = seg
+                    break
+            if candidate and len(candidate) > 3:
+                # Some names wrap onto a second line (e.g. "...COMPANY" /
+                # "PRIVATE LIMITED") -- reattach a short recognizable suffix.
+                for j in range(i + 1, min(i + 3, len(lines))):
+                    cont_seg = _first_segment(lines[j])
+                    if cont_seg and NAME_CONTINUATION_RE.match(cont_seg):
+                        candidate = f"{candidate} {cont_seg}"
+                    break
+                return candidate
+
+    # Fallback for formats with no "Customer:" label at all.
+    m = re.search(r'Name\s*(?:&|and)?\s*Address\s*of\s*the\s*rec[ei]{1,2}pient', text, re.IGNORECASE)
+    if m:
+        for line in text[m.end():].split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if re.search(r'Delivery|Ship\s*To|Address\s*Of', line, re.IGNORECASE):
+                continue
+            seg = _first_segment(line)
+            if seg and len(seg) > 3:
+                return seg
+    return "N/A"
+
+
+def extract_invoice_no(text):
+    m = re.search(
+        r'(?:Invoice\s*No\.?(?!umber)|Inv\.?\s*No\.?|INVOICE\s*NO)\s*[:\-]?\s*([A-Za-z0-9][\w\/\-]*)',
+        text, re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else "N/A"
+
+
+def extract_invoice_date(text):
+    # Prefer an explicit "Invoice Date" label.
+    m = re.search(
+        r'Invoice\s*Date\s*[:\-]?\s*(\d{1,2}[\/\.\- ][A-Za-z0-9]{1,9}[\/\.\- ]\d{2,4})',
+        text, re.IGNORECASE,
+    )
+    if m:
+        return parse_date(m.group(1))
+
+    # Otherwise fall back to a generic "Date" label, skipping "Ack Date",
+    # "Due Date", "Doc. Date", "LR Date" etc. which are different fields.
+    for m in re.finditer(
+        r'\bDate\b\s*[:\-]?\s*(\d{1,2}[\/\.\- ][A-Za-z0-9]{1,9}[\/\.\- ]\d{2,4})',
+        text, re.IGNORECASE,
+    ):
+        preceding = text[max(0, m.start() - 5):m.start()]
+        if re.search(r'Ack\s*$|Due\s*$|Doc\.\s*$|LR\s*$|Ref\s*$', preceding, re.IGNORECASE):
+            continue
+        return parse_date(m.group(1))
+    return None
+
+
+def extract_place_of_supply(text, customer_gstin):
+    m = re.search(
+        r'Place\s*of\s*Supply\s*[:\-]?\s*(\[?\d{0,2}\]?\s*[A-Za-z][A-Za-z\s]+)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        val = m.group(1).strip().split('\n')[0].strip()
+        if not re.search(r'AAHCC|GSTIN|PAN', val, re.IGNORECASE):
+            return val
+
+    # Fallback: look for a "State" mention near the customer's GSTIN.
+    if customer_gstin and customer_gstin != "N/A":
+        idx = text.find(customer_gstin)
+        if idx != -1:
+            window = text[max(0, idx - 150):idx + 150]
+            m2 = re.search(
+                r'State\s*(?:Code)?(?:\s*&\s*Name)?\s*:?\s*(?:\d{1,2}\s*-\s*)?([A-Za-z][A-Za-z\s]{2,30})',
+                window, re.IGNORECASE,
+            )
+            if m2:
+                val = _first_segment(m2.group(1))
+                if val and val.lower() not in ("code", "name", "address", "gstin") \
+                        and not re.search(r'GSTIN|Invoice|Name', val, re.IGNORECASE):
+                    return val
+
+    # Final fallback: derive the state purely from the customer's GSTIN
+    # state-code prefix (first 2 digits) -- reliable even when the invoice
+    # template prints a blank "State Code & Name:" field.
+    if customer_gstin and customer_gstin != "N/A" and len(customer_gstin) >= 2:
+        return GST_STATE_CODES.get(customer_gstin[:2], "N/A")
+    return "N/A"
+
+
+def extract_hsn(text):
+    """Tries, in order: an explicit HSN/SAC label; a bare service SAC code
+    (these commonly start with '99'); a comma/decimal-mangled code some
+    invoice templates print (e.g. '9,96,791.00' meaning HSN 996791); finally
+    a bare 8-digit goods HSN code."""
+    m = re.search(r'(?:HSN|SAC)\s*(?:Code)?\s*:?\s*(\d{4,8})\b', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    candidates = re.findall(r'\b(99\d{2,6})\b', text)
+    if candidates:
+        six_digit = [c for c in candidates if len(c) == 6]
+        return six_digit[0] if six_digit else candidates[0]
+
+    m = re.search(r'\b(\d{1,2},\d{2},\d{3})\.00\b', text)
+    if m:
+        return m.group(1).replace(',', '')
+
+    m = re.search(r'\b(\d{8})\b', text)
+    if m:
+        return m.group(1)
+
+    return "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Tax figure extraction
+# ---------------------------------------------------------------------------
+
+def _find_vertical_tax_amount(text, keyword):
+    """
+    Fallback for the 'vertical rate-of-tax' layout used by several GTA/freight
+    templates, where CGST/SGST/IGST each get their own row with a % rate then
+    an amount (amount may be '-' meaning nil, common under reverse charge).
+    """
+    m = re.search(
+        rf'\b{keyword}\b\s*[:\-]?((?:\s*(?:[\d,]+\.?\d*%?|-)){{1,4}})',
+        text, re.IGNORECASE,
+    )
+    if not m:
+        return 0.0
+    tokens = re.findall(r'[\d,]+\.?\d*%?|-', m.group(1))
+    if not tokens:
+        return 0.0
+    last = tokens[-1]
+    if last == '-':
+        return 0.0
+    return parse_float(last.rstrip('%'))
+
+
+def extract_tax_details(text):
+    result = {"taxable": 0.0, "cgst": 0.0, "sgst": 0.0, "igst": 0.0}
+    is_bill_of_supply = bool(re.search(r'Bill\s*Of\s*Supply', text, re.IGNORECASE))
+    # A "Reimbursement Invoice" (e.g. customs duty pass-through, Tax Type
+    # "P" = Pure Agent) carries no GST of its own -- the amount belongs in
+    # Non-Taxable/Exempt, exactly like a Bill of Supply.
+    is_reimbursement = bool(re.search(r'REIMBURSEMENT\s*INVOICE', text, re.IGNORECASE))
+    treat_as_exempt = is_bill_of_supply or is_reimbursement
+
+    # Layout family 1: a "Sub Total" row that lists Taxable Value followed by
+    # CGST/SGST (or IGST) followed by a running total, all on one line.
+    sub_total_m = re.search(
+        r'Sub\s*Total\s*(?:\[INR\])?\s*((?:[\d,]+\.\d{2}\s*){1,4})',
+        text, re.IGNORECASE,
+    )
+    if sub_total_m:
+        nums = [parse_float(n) for n in re.findall(r'[\d,]+\.\d{2}', sub_total_m.group(1))]
+        if len(nums) >= 4:
+            result["taxable"], result["cgst"], result["sgst"] = nums[0], nums[1], nums[2]
+        elif len(nums) == 3:
+            result["taxable"], result["igst"] = nums[0], nums[1]
+        elif len(nums) >= 1:
+            result["taxable"] = nums[0]
+    else:
+        # Layout family 2: a single "Total Taxable Amount" figure with
+        # CGST/SGST/IGST given separately (often as a vertical rate/amount
+        # table, frequently zero under GTA reverse-charge).
+        taxable_m = re.search(
+            r'Total\s*Taxable\s*Amount\s*[:\-]?\s*([\d,]+\.?\d{0,2})',
+            text, re.IGNORECASE,
+        )
+        if taxable_m:
+            result["taxable"] = parse_float(taxable_m.group(1))
+        else:
+            # Layout family 3: a single-row SAC/Taxable-Value table, e.g.
+            # "996791   58700.00   ...   0 0 0 0"
+            m = re.search(r'\b\d{6}\b\s+([\d,]+\.\d{2})', text)
+            if m:
+                result["taxable"] = parse_float(m.group(1))
+
+        result["cgst"] = _find_vertical_tax_amount(text, "CGST")
+        result["sgst"] = _find_vertical_tax_amount(text, "SGST")
+        result["igst"] = _find_vertical_tax_amount(text, "IGST")
+
+    total_tax = round(result["cgst"] + result["sgst"] + result["igst"], 2)
+
+    # ---- Grand total, tried in priority order across the templates -------
+    grand_total = None
+    m = re.search(
+        r'Total\s*Invoice\s*Value\s*(?:\(?INR\)?)?\s*[:\-]?\s*(?:INR)?\s*([\d,]+\.\d{1,2})',
+        text, re.IGNORECASE,
+    )
+    if m:
+        grand_total = parse_float(m.group(1))
+    if grand_total is None:
+        m = re.search(r'Gross\s*Total\s*[:\-]?\s*([\d,]+\.?\d{0,2})', text, re.IGNORECASE)
         if m:
-            name = m.group(1).strip()
-            if not re.search(r'Page\s*:|GSTIN|PAN|State|Address|Phone|Invoice', name, re.IGNORECASE) and len(name) > 3:
-                return name
+            grand_total = parse_float(m.group(1))
+    if grand_total is None:
+        matches = re.findall(r'Total\s*\[INR\]\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
+        if matches:
+            grand_total = parse_float(matches[-1])
+    if grand_total is None:
+        m_all = list(re.finditer(r'Total\s*Amount\s*\[INR\]\s*((?:[\d,]+\.\d{2}\s*)+)', text, re.IGNORECASE))
+        if m_all:
+            nums = re.findall(r'[\d,]+\.\d{2}', m_all[-1].group(1))
+            if nums:
+                grand_total = parse_float(nums[-1])
 
-    return "N/A"
+    non_taxable = 0.0
+    taxable = result["taxable"]
+    if treat_as_exempt:
+        # A "Bill of Supply" / reimbursement invoice is exempt / nil-rated --
+        # the amount belongs in Non-Taxable/Exempt, not Taxable Value.
+        non_taxable = taxable
+        taxable = 0.0
 
-def extract_place_of_supply(text):
-    """Extracts Place of Supply directly matching state names or codes."""
-    match = re.search(r'Place\s*of\s*Supply\s*[:\-]?\s*(\[[0-9]+\]\s*[A-Za-z\s]+|[A-Za-z\s]+)', text, re.IGNORECASE)
-    if match:
-        pos = match.group(1).strip().split('\n')[0]
-        if not re.search(r'AAHCC|GSTIN|PAN', pos, re.IGNORECASE):
-            return pos
-    return "N/A"
+    # Layout family 4: some templates (e.g. Credit Memos) print only a
+    # "Line Total [INR]" / "Total [INR]" figure with no separate taxable-value
+    # or tax breakdown at all. If nothing else matched and there's no tax on
+    # the invoice, the grand total itself IS the taxable (or exempt) value.
+    if taxable == 0.0 and non_taxable == 0.0 and total_tax == 0.0 and grand_total:
+        if treat_as_exempt:
+            non_taxable = grand_total
+        else:
+            taxable = grand_total
 
-def extract_hsn_sac(text):
-    """Extracts HSN/SAC code from line item tables while ignoring PIN codes."""
-    match_table = re.search(r'(?:SAC\s*\/\s*HSN|HSN\s*\/\s*SAC|SAC|HSN)\s*[\n\r\s]+([0-9]{4,8})', text, re.IGNORECASE)
-    if match_table:
-        code = match_table.group(1).strip()
-        if not code.startswith("6000") and not code.startswith("1100"):
-            return code
+    if grand_total is None:
+        grand_total = round(taxable + non_taxable + total_tax, 2)
 
-    match_inline = re.search(r'(?:SAC\s*Code|HSN\s*Code)\s*[:\-]?\s*([0-9]{4,8})', text, re.IGNORECASE)
-    if match_inline:
-        return match_inline.group(1).strip()
+    return {
+        "non_taxable": round(non_taxable, 2),
+        "taxable": round(taxable, 2),
+        "cgst": round(result["cgst"], 2),
+        "sgst": round(result["sgst"], 2),
+        "igst": round(result["igst"], 2),
+        "total_tax": total_tax,
+        "grand_total": round(grand_total, 2),
+    }
 
-    sac_fallback = re.search(r'\b(99\d{4})\b', text)
-    if sac_fallback:
-        return sac_fallback.group(1).strip()
 
-    return "N/A"
-
-def extract_line_item_breakdown(text):
-    """
-    Parses line item tables to extract Non-Taxable / Exempt Values, Taxable Values,
-    CGST, SGST, and IGST line by line.
-    """
-    non_taxable_exempt = 0.0
-    taxable_value = 0.0
-    cgst = 0.0
-    sgst = 0.0
-    igst = 0.0
-
-    # Pattern for Reimbursement / Non GST Exempt Line Items (e.g., CUSTOMS DUTY -REIM - SI)
-    reim_items = re.findall(r'(?:REIM|REIMBURSEMENT|DUTY|NON-GST|EXEMPT)[\s\S]*?([\d,]+\.\d{2})', text, re.IGNORECASE)
-    
-    # Check table structure for "Non GST Exempt Value (INR)" column
-    exempt_match = re.search(r'Non\s*GST\s*Exempt\s*Value\s*(?:\(INR\))?[\s\S]*?([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if exempt_match:
-        non_taxable_exempt = parse_float(exempt_match.group(1))
-
-    # Check Taxable Value column
-    taxable_match = re.search(r'Taxable\s*Value\s*(?:\(INR\))?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if taxable_match:
-        taxable_value = parse_float(taxable_match.group(1))
-
-    # Check IGST column
-    igst_match = re.search(r'IGST[\s\S]{1,30}?Tax[\s\S]{1,30}?([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if igst_match:
-        igst = parse_float(igst_match.group(1))
-
-    # Check CGST / SGST columns
-    cgst_match = re.search(r'CGST[\s\S]{1,30}?Tax[\s\S]{1,30}?([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if cgst_match:
-        cgst = parse_float(cgst_match.group(1))
-
-    sgst_match = re.search(r'SGST[\s\S]{1,30}?Tax[\s\S]{1,30}?([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if sgst_match:
-        sgst = parse_float(sgst_match.group(1))
-
-    return non_taxable_exempt, taxable_value, cgst, sgst, igst
+# ---------------------------------------------------------------------------
+# Main per-invoice extraction
+# ---------------------------------------------------------------------------
 
 def extract_sales_invoice_data(pdf_bytes):
-    """Extracts required fields from Chakradhara Aerospace invoice formats."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = "".join([page.get_text() for page in doc])
-    doc.close()
+    """Extracts required fields from a Chakradhara Aerospace sales invoice PDF."""
+    text = get_pdf_text(pdf_bytes)
 
-    # 1. GSTIN Identification
-    all_gstins = re.findall(r'\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}\b', text)
-    
-    my_gstin = "N/A"
-    customer_gstin = "N/A"
-
-    for gstin in all_gstins:
-        if gstin in COMPANY_GSTINS and my_gstin == "N/A":
-            my_gstin = gstin
-        elif gstin not in COMPANY_GSTINS and customer_gstin == "N/A":
-            customer_gstin = gstin
-
-    if my_gstin == "N/A" and len(all_gstins) > 0:
-        my_gstin = all_gstins[0]
-    if customer_gstin == "N/A" and len(all_gstins) > 1:
-        customer_gstin = all_gstins[1]
-
-    # 2. Customer Name & Place of Supply
+    my_gstin, customer_gstin = extract_gstins(text)
     customer_name = extract_customer_name(text)
-    place_of_supply = extract_place_of_supply(text)
-
-    # 3. Invoice Number
-    inv_no_match = re.search(r'(?:Invoice\s*No\.?|Inv\s*No\.?|INVOICE\040NO|Invoice\s*#)\s*[:\-]?\s*([A-Za-z0-9\/\-]+)', text, re.IGNORECASE)
-    invoice_no = inv_no_match.group(1).strip() if inv_no_match else "N/A"
-
-    # 4. Invoice Date
-    inv_date_match = re.search(r'(?:Invoice\s*Date|Inv\.\s*Date|DATE|Dated|Date)\s*[:\-]?\s*(\d{1,2}[\/\.-]\w+[\/\.-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', text, re.IGNORECASE)
-    raw_date = inv_date_match.group(1).strip() if inv_date_match else "N/A"
-    invoice_date = parse_date(raw_date)
-
-    # 5. HSN / SAC Code
-    hsn_code = extract_hsn_sac(text)
-
-    # 6. Extract Line Item Tax Breakdown
-    non_taxable_exempt, taxable_value, cgst, sgst, igst = extract_line_item_breakdown(text)
-
-    total_tax = round(cgst + sgst + igst, 2)
-
-    # 7. Total Invoice Value
-    total_match = re.search(r'Total\s*(?:\(INR\)|Value|Amount)?\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if total_match:
-        total_invoice_value = parse_float(total_match.group(1))
-    else:
-        total_invoice_value = round(taxable_value + non_taxable_exempt + total_tax, 2)
+    invoice_no = extract_invoice_no(text)
+    invoice_date = extract_invoice_date(text)
+    place_of_supply = extract_place_of_supply(text, customer_gstin)
+    hsn_code = extract_hsn(text)
+    tax = extract_tax_details(text)
 
     return {
         "GSTIN": my_gstin,
@@ -214,14 +454,19 @@ def extract_sales_invoice_data(pdf_bytes):
         "Invoice Date": invoice_date,
         "Place of Supply": place_of_supply,
         "HSN/SAC": hsn_code,
-        "Non-Taxable / Exempt Value": non_taxable_exempt,
-        "Taxable Value": taxable_value,
-        "CGST": cgst,
-        "SGST": sgst,
-        "IGST": igst,
-        "Total Tax": total_tax,
-        "Total Invoice Value": total_invoice_value
+        "Non-Taxable / Exempt Value": tax["non_taxable"],
+        "Taxable Value": tax["taxable"],
+        "CGST": tax["cgst"],
+        "SGST": tax["sgst"],
+        "IGST": tax["igst"],
+        "Total Tax": tax["total_tax"],
+        "Total Invoice Value": tax["grand_total"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Excel export
+# ---------------------------------------------------------------------------
 
 def format_excel_workbook(df):
     """Formats Excel file with correct Date, Number types, Alignment, Auto-filters, and Auto-fit."""
@@ -233,19 +478,17 @@ def format_excel_workbook(df):
     headers = list(df.columns)
     ws.append(headers)
 
-    # Style Header Row
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_num)
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     num_cols = {"Non-Taxable / Exempt Value", "Taxable Value", "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value"}
-    
-    # Append Data Rows
+
     for row_idx, row in enumerate(df.itertuples(index=False), start=2):
         for col_idx, (col_name, val) in enumerate(zip(headers, row), start=1):
             cell = ws.cell(row=row_idx, column=col_idx)
-            
+
             if col_name == "Invoice Date" and pd.notnull(val):
                 cell.value = val
                 cell.number_format = 'yyyy-mm-dd'
@@ -260,7 +503,6 @@ def format_excel_workbook(df):
 
     ws.auto_filter.ref = ws.dimensions
 
-    # Universal Auto-Fit Column Widths
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -275,6 +517,11 @@ def format_excel_workbook(df):
     wb.save(output)
     return output.getvalue()
 
+
+# ---------------------------------------------------------------------------
+# Streamlit app
+# ---------------------------------------------------------------------------
+
 if uploaded_files:
     if st.button("Extract Invoice Details"):
         results = []
@@ -285,9 +532,9 @@ if uploaded_files:
             results.append(extracted_info)
 
         df = pd.DataFrame(results)
-        
-        cols = ["Filename", "GSTIN", "Customer Name", "Customer GSTIN", "Invoice No", "Invoice Date", 
-                "Place of Supply", "HSN/SAC", "Non-Taxable / Exempt Value", "Taxable Value", 
+
+        cols = ["Filename", "GSTIN", "Customer Name", "Customer GSTIN", "Invoice No", "Invoice Date",
+                "Place of Supply", "HSN/SAC", "Non-Taxable / Exempt Value", "Taxable Value",
                 "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value"]
         df = df[cols]
 
