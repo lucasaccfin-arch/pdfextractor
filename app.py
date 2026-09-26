@@ -8,6 +8,17 @@ import openpyxl
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
+# OCR fallback for scanned / image-only PDFs (no embedded text layer).
+# Optional: if pytesseract or the tesseract binary aren't installed, the app
+# still runs fine -- it just can't rescue image-only pages, and will flag
+# them in the "Extraction Notes" column instead of silently returning N/A.
+try:
+    import pytesseract
+    from PIL import Image
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
+
 st.set_page_config(page_title="Chakradhara Aerospace - Sales Invoice Extractor", page_icon="✈️", layout="wide")
 
 st.title("✈️ Chakradhara Aerospace - Sales Invoice Extractor")
@@ -108,18 +119,67 @@ def clean_text(text):
     return re.sub(r'\S{60,}', ' ', text)
 
 
+def _ocr_extract(doc):
+    """Rasterizes each page at high DPI and runs Tesseract OCR over it.
+    Used only when the PDF has little or no embedded text (i.e. it's a
+    scanned image / photo of the invoice rather than a digitally
+    generated one)."""
+    if not _OCR_AVAILABLE:
+        return ""
+    chunks = []
+    for page in doc:
+        try:
+            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))  # ~300 DPI
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            chunks.append(pytesseract.image_to_string(img))
+        except Exception:
+            continue
+    return "\n".join(chunks)
+
+
 def get_pdf_text(pdf_bytes):
     """
-    Extracts text using PyMuPDF with sort=True, which reorders text into
-    natural reading order. Without this, PyMuPDF returns text in internal
-    PDF-object order, which for table-heavy invoices comes out scrambled
-    (numbers from unrelated rows/columns interleave with each other) --
-    this was the root cause of most of the bad extractions previously.
+    Extracts text from the PDF, trying multiple strategies and picking
+    whichever yields the most usable result:
+
+    1. PyMuPDF with sort=True, which reorders text into natural reading
+       order. Without this, PyMuPDF returns text in internal PDF-object
+       order, which for table-heavy invoices comes out scrambled (numbers
+       from unrelated rows/columns interleave with each other).
+    2. PyMuPDF with sort=False (default order) -- for a minority of
+       templates the raw object order actually keeps label/value pairs
+       together better than the sort heuristic does.
+    3. OCR (Tesseract), used only as a last resort when neither of the
+       above produced meaningful text. This is what rescues invoices that
+       are scanned/photographed rather than digitally generated -- those
+       have no embedded text layer at all, so PyMuPDF returns next to
+       nothing and every field would otherwise come back "N/A".
+
+    Returns a tuple: (text, extraction_method) so the caller can record
+    how the text was obtained (useful for the "Extraction Notes" column).
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = "\n".join(page.get_text(sort=True) for page in doc)
+
+    text_sorted = clean_text("\n".join(page.get_text(sort=True) for page in doc))
+    text_plain = clean_text("\n".join(page.get_text(sort=False) for page in doc))
+
+    if len(text_sorted.strip()) >= len(text_plain.strip()):
+        best_text, method = text_sorted, "text (sorted)"
+    else:
+        best_text, method = text_plain, "text (raw order)"
+
+    # Fewer than ~40 non-whitespace characters across the whole document
+    # means there's essentially no embedded text -- almost certainly a
+    # scanned/photographed page rather than a digitally generated PDF.
+    if len(re.sub(r'\s', '', best_text)) < 40:
+        ocr_text = clean_text(_ocr_extract(doc))
+        if len(re.sub(r'\s', '', ocr_text)) > len(re.sub(r'\s', '', best_text)):
+            best_text, method = ocr_text, ("OCR" if ocr_text.strip() else "none (no text found)")
+        elif not best_text.strip():
+            method = "none (no text found)"
+
     doc.close()
-    return clean_text(text)
+    return best_text, method
 
 
 # ---------------------------------------------------------------------------
@@ -154,11 +214,19 @@ def _first_segment(s):
 
 
 def _looks_like_label_junk(s):
-    """True if a candidate name is actually a neighbouring field label that
-    got pulled onto the same line by the PDF's column layout."""
+    """True if a candidate name is actually a neighbouring field label or
+    table-column header that got pulled onto the same line/position by the
+    PDF's column layout (very common in freight/GTA consignment-note
+    templates, where headers like "Billing Remarks", "LR No", "Vehicle No"
+    etc. sit right next to the "Name and Address of Recipient" block once
+    the text is reordered)."""
     return bool(re.search(
         r':|Invoice\s*No|Invoice\s*Date|\bGSTIN\b|\bPAN\b|Ref\.\s*No|Division\s*:|\bAck\b|'
-        r'State\s*:|Address\s*:|^Date\b',
+        r'State\s*:|Address\s*:|^Date\b|Delivery|Ship\s*To|Address\s*Of|'
+        r'Billing\s*Remarks|^Remarks$|LR\s*No|L\.?R\.?\s*No|Vehicle\s*No|Driver|'
+        r'Consignment|Freight|E-?way|Bilty|Description|Particulars|'
+        r'Weight|Quantity|^Rate\b|^Amount\b|\bHSN\b|\bSAC\b|Bank|IFSC|'
+        r'Terms\s*of|Bill\s*Type|Reverse\s*Charge',
         s, re.IGNORECASE,
     ))
 
@@ -205,20 +273,48 @@ def extract_customer_name(text):
             line = line.strip()
             if not line:
                 continue
-            if re.search(r'Delivery|Ship\s*To|Address\s*Of', line, re.IGNORECASE):
-                continue
             seg = _first_segment(line)
-            if seg and len(seg) > 3:
+            if seg and len(seg) > 3 and not _looks_like_label_junk(seg):
                 return seg
     return "N/A"
 
 
 def extract_invoice_no(text):
-    m = re.search(
-        r'(?:Invoice\s*No\.?(?!umber)|Inv\.?\s*No\.?|INVOICE\s*NO)\s*[:\-]?\s*([A-Za-z0-9][\w\/\-]*)',
-        text, re.IGNORECASE,
+    """Finds the invoice number after an "Invoice No" / "Inv No" label.
+
+    Some templates have another short field (e.g. "Bill Type: B") sitting
+    right next to "Invoice No" once the PDF's columns get flattened into a
+    single text stream, so the very next token after the label isn't
+    always the real invoice number -- it can be a stray single letter.
+    To guard against that, every token on the rest of that line is
+    considered and the first one that actually looks like an invoice
+    number (at least 3 characters, contains a digit) is preferred; only if
+    nothing on the line qualifies do we fall back to the first token."""
+    label_re = re.compile(
+        r'(?:Invoice\s*No\.?(?!umber)|Inv\.?\s*No\.?|INVOICE\s*NO)\s*[:\-]?\s*',
+        re.IGNORECASE,
     )
-    return m.group(1).strip() if m else "N/A"
+    fallback = None
+    for m in label_re.finditer(text):
+        # Look at the rest of this line, and -- in case the label and its
+        # value ended up on separate lines -- the following couple of
+        # lines too.
+        following_lines = text[m.end():].split('\n')[:3]
+        rest_of_line = following_lines[0]
+        tokens = re.findall(r'[A-Za-z0-9][\w\/\-]*', rest_of_line)
+        if not tokens:
+            continue
+        if fallback is None:
+            fallback = tokens[0]
+        good = next((t for t in tokens if len(t) >= 3 and re.search(r'\d', t)), None)
+        if good:
+            return good
+        for extra_line in following_lines[1:]:
+            extra_tokens = re.findall(r'[A-Za-z0-9][\w\/\-]*', extra_line.strip())
+            good = next((t for t in extra_tokens if len(t) >= 3 and re.search(r'\d', t)), None)
+            if good:
+                return good
+    return fallback if fallback else "N/A"
 
 
 def extract_invoice_date(text):
@@ -433,7 +529,7 @@ def extract_tax_details(text):
 
 def extract_sales_invoice_data(pdf_bytes):
     """Extracts required fields from a Chakradhara Aerospace sales invoice PDF."""
-    text = get_pdf_text(pdf_bytes)
+    text, extraction_method = get_pdf_text(pdf_bytes)
 
     my_gstin, customer_gstin = extract_gstins(text)
     customer_name = extract_customer_name(text)
@@ -442,6 +538,20 @@ def extract_sales_invoice_data(pdf_bytes):
     place_of_supply = extract_place_of_supply(text, customer_gstin)
     hsn_code = extract_hsn(text)
     tax = extract_tax_details(text)
+
+    fields = [my_gstin, customer_name, customer_gstin, invoice_no, place_of_supply, hsn_code]
+    na_count = sum(1 for f in fields if f == "N/A") + (1 if invoice_date is None else 0)
+
+    if extraction_method == "none (no text found)":
+        note = "No text extracted -- likely a scanned/photographed PDF; install OCR support or re-export the invoice as a text PDF."
+    elif extraction_method == "OCR":
+        note = "Recovered via OCR (scanned PDF) -- please double-check the values."
+    elif na_count >= 5:
+        note = "Most fields missing -- this invoice's layout may not match any known template. Check manually."
+    elif na_count > 0:
+        note = "Some fields missing -- check manually."
+    else:
+        note = "OK"
 
     return {
         "GSTIN": my_gstin,
@@ -458,6 +568,8 @@ def extract_sales_invoice_data(pdf_bytes):
         "IGST": tax["igst"],
         "Total Tax": tax["total_tax"],
         "Total Invoice Value": tax["grand_total"],
+        "Extraction Notes": note,
+        "_raw_text": text,
     }
 
 
@@ -526,6 +638,18 @@ if "excel_bytes" not in st.session_state:
     st.session_state.excel_bytes = None
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
+if "raw_text_by_file" not in st.session_state:
+    st.session_state.raw_text_by_file = {}
+
+if not _OCR_AVAILABLE:
+    st.info(
+        "OCR support isn't installed, so scanned/photographed invoices with no "
+        "embedded text layer can't be recovered automatically (they'll show "
+        "'No text extracted' in Extraction Notes). To enable OCR, add "
+        "`pytesseract` and `pillow` to requirements.txt and `tesseract-ocr` "
+        "to packages.txt (if deploying on Streamlit Community Cloud).",
+        icon="ℹ️",
+    )
 
 
 def clear_all():
@@ -534,6 +658,7 @@ def clear_all():
     empty)."""
     st.session_state.extracted_df = None
     st.session_state.excel_bytes = None
+    st.session_state.raw_text_by_file = {}
     st.session_state.uploader_key += 1
 
 
@@ -561,9 +686,15 @@ if uploaded_files:
 
         df = pd.DataFrame(results)
 
+        # Keep the raw extracted text alongside the results (for the
+        # in-app debug viewer below) but never write it into the Excel
+        # export -- it's only there to help diagnose problem invoices.
+        raw_text_by_file = dict(zip(df["Filename"], df["_raw_text"]))
+        st.session_state.raw_text_by_file = raw_text_by_file
+
         cols = ["Filename", "GSTIN", "Customer Name", "Customer GSTIN", "Invoice No", "Invoice Date",
                 "Place of Supply", "HSN/SAC", "Non-Taxable / Exempt Value", "Taxable Value",
-                "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value"]
+                "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value", "Extraction Notes"]
         df = df[cols]
 
         st.session_state.extracted_df = df
@@ -574,8 +705,27 @@ elif st.session_state.extracted_df is not None:
     st.button("🔄 Clear", on_click=clear_all)
 
 if st.session_state.extracted_df is not None:
-    st.success(f"Processed {len(st.session_state.extracted_df)} invoices successfully!")
-    st.dataframe(st.session_state.extracted_df)
+    df_display = st.session_state.extracted_df
+    flagged = df_display[df_display["Extraction Notes"] != "OK"]
+    if len(flagged) > 0:
+        st.warning(
+            f"{len(flagged)} of {len(df_display)} invoice(s) have missing or "
+            "uncertain fields -- see the 'Extraction Notes' column below, and "
+            "use 'Inspect raw extracted text' to see exactly what was pulled "
+            "from the PDF for a given file."
+        )
+    else:
+        st.success(f"Processed {len(df_display)} invoices successfully!")
+    st.dataframe(df_display)
+
+    with st.expander("🔍 Inspect raw extracted text (for troubleshooting)"):
+        file_choice = st.selectbox(
+            "Choose a file to inspect", list(st.session_state.raw_text_by_file.keys())
+        )
+        if file_choice:
+            raw = st.session_state.raw_text_by_file.get(file_choice, "")
+            st.caption(f"{len(raw)} characters extracted")
+            st.text_area("Extracted text", raw or "(nothing was extracted from this PDF)", height=300)
 
     st.download_button(
         label="📥 Download Structured Excel File",
