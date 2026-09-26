@@ -424,12 +424,6 @@ def _find_vertical_tax_amount(text, keyword):
 
 def extract_tax_details(text):
     result = {"taxable": 0.0, "cgst": 0.0, "sgst": 0.0, "igst": 0.0}
-    is_bill_of_supply = bool(re.search(r'Bill\s*Of\s*Supply', text, re.IGNORECASE))
-    # A "Reimbursement Invoice" (e.g. customs duty pass-through, Tax Type
-    # "P" = Pure Agent) carries no GST of its own -- the amount belongs in
-    # Non-Taxable/Exempt, exactly like a Bill of Supply.
-    is_reimbursement = bool(re.search(r'REIMBURSEMENT\s*INVOICE', text, re.IGNORECASE))
-    treat_as_exempt = is_bill_of_supply or is_reimbursement
 
     # Layout family 1: a "Sub Total" row that lists Taxable Value followed by
     # CGST/SGST (or IGST) followed by a running total, all on one line.
@@ -491,23 +485,29 @@ def extract_tax_details(text):
             if nums:
                 grand_total = parse_float(nums[-1])
 
-    non_taxable = 0.0
-    taxable = result["taxable"]
-    if treat_as_exempt:
-        # A "Bill of Supply" / reimbursement invoice is exempt / nil-rated --
-        # the amount belongs in Non-Taxable/Exempt, not Taxable Value.
-        non_taxable = taxable
-        taxable = 0.0
+    # Non-Taxable / Exempt Value is picked up ONLY when the invoice
+    # explicitly labels an amount as Non-Taxable, Exempt(ed), Nil-Rated or
+    # Non-GST -- never inferred just from the document being titled "Bill
+    # of Supply", "Reimbursement Invoice", etc. Those document types can
+    # still carry GST payable by the recipient under reverse charge (as in
+    # a GTA Bill of Supply), so the line-item value itself is a normal
+    # taxable amount, not an exempt one, unless the invoice says so.
+    non_taxable_m = re.search(
+        r'(?:Non[-\s]?Taxable|Nil[-\s]?Rated|Exempt(?:ed)?|Non[-\s]?GST(?:\s*Supply)?)'
+        r'\s*(?:Value|Amount)?\s*(?:\[INR\])?\s*[:\-]?\s*(?:INR)?\s*([\d,]+\.\d{1,2})',
+        text, re.IGNORECASE,
+    )
+    non_taxable = parse_float(non_taxable_m.group(1)) if non_taxable_m else 0.0
 
-    # Layout family 4: some templates (e.g. Credit Memos) print only a
-    # "Line Total [INR]" / "Total [INR]" figure with no separate taxable-value
-    # or tax breakdown at all. If nothing else matched and there's no tax on
-    # the invoice, the grand total itself IS the taxable (or exempt) value.
+    taxable = result["taxable"]
+
+    # Layout family 4: some templates (e.g. Credit Memos, Bills of Supply)
+    # print only a "Line Total [INR]" / "Total [INR]" figure with no
+    # separate taxable-value or tax breakdown at all. If nothing else
+    # matched and there's no tax and no explicit non-taxable/exempt wording,
+    # the grand total itself IS the taxable value by default.
     if taxable == 0.0 and non_taxable == 0.0 and total_tax == 0.0 and grand_total:
-        if treat_as_exempt:
-            non_taxable = grand_total
-        else:
-            taxable = grand_total
+        taxable = grand_total
 
     if grand_total is None:
         grand_total = round(taxable + non_taxable + total_tax, 2)
@@ -524,6 +524,44 @@ def extract_tax_details(text):
 
 
 # ---------------------------------------------------------------------------
+# Invoice type / document type extraction
+# ---------------------------------------------------------------------------
+
+# Checked in priority order (most specific document types first) so that,
+# e.g., a "Bill of Supply" that happens to mention "invoice" elsewhere in
+# its body doesn't get misclassified as a generic "Tax Invoice".
+_INVOICE_TYPE_PATTERNS = [
+    (re.compile(r'\bBill\s*Of\s*Supply\b', re.IGNORECASE), "Bill of Supply"),
+    (re.compile(r'\bReimbursement\s*Invoice\b', re.IGNORECASE), "Reimbursement Invoice"),
+    (re.compile(r'\bCredit\s*Memo\b', re.IGNORECASE), "Credit Memo"),
+    (re.compile(r'\bCredit\s*Note\b', re.IGNORECASE), "Credit Note"),
+    (re.compile(r'\bDebit\s*Memo\b', re.IGNORECASE), "Debit Memo"),
+    (re.compile(r'\bDebit\s*Note\b', re.IGNORECASE), "Debit Note"),
+    (re.compile(r'\bProforma\s*Invoice\b', re.IGNORECASE), "Proforma Invoice"),
+    (re.compile(r'\bDelivery\s*Challan\b', re.IGNORECASE), "Delivery Challan"),
+    (re.compile(r'\bTax\s*Invoice\b', re.IGNORECASE), "Tax Invoice"),
+]
+
+
+def extract_invoice_type(text):
+    """Identifies the document type (Tax Invoice / Bill of Supply / Credit
+    Memo / etc.) from the heading printed at the top of the document.
+    Checks only the first ~800 characters first, since that's where the
+    document title is always printed; falls back to searching the whole
+    text in case the heading landed further down after text reordering."""
+    head = text[:800]
+    for pattern, label in _INVOICE_TYPE_PATTERNS:
+        if pattern.search(head):
+            return label
+    for pattern, label in _INVOICE_TYPE_PATTERNS:
+        if pattern.search(text):
+            return label
+    if re.search(r'\bINVOICE\b', text, re.IGNORECASE):
+        return "Invoice"
+    return "N/A"
+
+
+# ---------------------------------------------------------------------------
 # Main per-invoice extraction
 # ---------------------------------------------------------------------------
 
@@ -533,13 +571,14 @@ def extract_sales_invoice_data(pdf_bytes):
 
     my_gstin, customer_gstin = extract_gstins(text)
     customer_name = extract_customer_name(text)
+    invoice_type = extract_invoice_type(text)
     invoice_no = extract_invoice_no(text)
     invoice_date = extract_invoice_date(text)
     place_of_supply = extract_place_of_supply(text, customer_gstin)
     hsn_code = extract_hsn(text)
     tax = extract_tax_details(text)
 
-    fields = [my_gstin, customer_name, customer_gstin, invoice_no, place_of_supply, hsn_code]
+    fields = [my_gstin, customer_name, customer_gstin, invoice_type, invoice_no, place_of_supply, hsn_code]
     na_count = sum(1 for f in fields if f == "N/A") + (1 if invoice_date is None else 0)
 
     if extraction_method == "none (no text found)":
@@ -557,6 +596,7 @@ def extract_sales_invoice_data(pdf_bytes):
         "GSTIN": my_gstin,
         "Customer Name": customer_name,
         "Customer GSTIN": customer_gstin,
+        "Invoice Type": invoice_type,
         "Invoice No": invoice_no,
         "Invoice Date": invoice_date,
         "Place of Supply": place_of_supply,
@@ -692,7 +732,7 @@ if uploaded_files:
         raw_text_by_file = dict(zip(df["Filename"], df["_raw_text"]))
         st.session_state.raw_text_by_file = raw_text_by_file
 
-        cols = ["Filename", "GSTIN", "Customer Name", "Customer GSTIN", "Invoice No", "Invoice Date",
+        cols = ["Filename", "GSTIN", "Customer Name", "Customer GSTIN", "Invoice Type", "Invoice No", "Invoice Date",
                 "Place of Supply", "HSN/SAC", "Non-Taxable / Exempt Value", "Taxable Value",
                 "CGST", "SGST", "IGST", "Total Tax", "Total Invoice Value", "Extraction Notes"]
         df = df[cols]
